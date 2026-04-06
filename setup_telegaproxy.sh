@@ -43,6 +43,70 @@ get_ip() {
     echo "$ip" | grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1
 }
 
+# --- ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ БЕЗОПАСНОГО SECRET ---
+generate_safe_secret() {
+    local domain=$1
+    local secret=""
+    local max_attempts=5
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        secret=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null)
+        
+        # Проверяем, начинается ли секрет с "ee"
+        if [[ ! "$secret" =~ ^ee ]]; then
+            echo "$secret"
+            return 0
+        fi
+        
+        # Если начинается с "ee", пробуем другой домен
+        attempt=$((attempt + 1))
+        echo -e "${YELLOW}[!] Секрет начинается с 'ee' (проблема на Android), пробуем другой домен...${NC}" >&2
+        domain=$(get_random_domain)
+    done
+    
+    # Если все попытки неудачны, генерируем без домена
+    echo -e "${YELLOW}[!] Использую генерацию без домена...${NC}" >&2
+    secret=$(docker run --rm nineseconds/mtg:2 generate-secret --hex 2>/dev/null)
+    
+    # Если всё ещё начинается с ee, меняем один символ
+    if [[ "$secret" =~ ^ee ]]; then
+        secret="ff${secret:2}"
+    fi
+    
+    echo "$secret"
+}
+
+# --- ПОЛУЧИТЬ СЛУЧАЙНЫЙ ДОМЕН ---
+get_random_domain() {
+    domains=(
+        "google.com" "wikipedia.org" "github.com"
+        "microsoft.com" "cloudflare.com" "amazon.com"
+        "stackoverflow.com" "gitlab.com" "docker.com"
+    )
+    echo "${domains[$RANDOM % ${#domains[@]}]}"
+}
+
+# --- ПРОВЕРКА SECRET НА ПРОБЛЕМНЫЕ ПАТТЕРНЫ ---
+validate_secret() {
+    local secret=$1
+    
+    # Проверка на проблемные начала для Android
+    if [[ "$secret" =~ ^ee ]]; then
+        echo -e "${RED}⚠️  ВНИМАНИЕ: Секрет начинается с 'ee' - НЕ БУДЕТ РАБОТАТЬ НА ANDROID!${NC}"
+        return 1
+    fi
+    
+    # Проверка на другие проблемные паттерны
+    if [[ "$secret" =~ ^[0-9a-f]{2}$ ]]; then
+        echo -e "${YELLOW}⚠️  ВНИМАНИЕ: Секрет слишком короткий!${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}✓ Секрет валиден для Android${NC}"
+    return 0
+}
+
 # --- ПРОМО ---
 show_promo() {
     clear
@@ -84,6 +148,11 @@ show_config() {
     for CONTAINER in "${containers[@]}"; do
         PORT=$(docker inspect "$CONTAINER" --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
         SECRET=$(docker inspect "$CONTAINER" --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}')
+        
+        # Проверяем секрет на проблемные паттерны
+        if [[ "$SECRET" =~ ^ee ]]; then
+            echo -e "${RED}⚠️  ВНИМАНИЕ: Этот прокси НЕ РАБОТАЕТ на Android! (секрет начинается с ee)${NC}"
+        fi
 
         LINK="tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
 
@@ -91,6 +160,13 @@ show_config() {
         echo -e "${CYAN}Контейнер:${NC} $CONTAINER"
         echo -e "IP: $IP | Port: $PORT"
         echo -e "Secret: $SECRET"
+        
+        if [[ "$SECRET" =~ ^ee ]]; then
+            echo -e "${RED}❌ НЕ РАБОТАЕТ НА ANDROID!${NC}"
+        else
+            echo -e "${GREEN}✓ РАБОТАЕТ НА ANDROID${NC}"
+        fi
+        
         echo -e "Link: ${BLUE}$LINK${NC}"
         qrencode -t ANSIUTF8 "$LINK"
         echo "----------------------------------------"
@@ -144,8 +220,17 @@ menu_install() {
     fi
 
     echo -e "${YELLOW}[*] Настройка прокси...${NC}"
-
-    SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$DOMAIN")
+    
+    # Генерируем безопасный секрет
+    echo -e "${YELLOW}[*] Генерация секрета (проверка на совместимость с Android)...${NC}"
+    SECRET=$(generate_safe_secret "$DOMAIN")
+    
+    # Валидация секрета
+    if ! validate_secret "$SECRET"; then
+        echo -e "${RED}[!] Секрет проблемный! Пробую сгенерировать заново...${NC}"
+        SECRET=$(generate_safe_secret "google.com")
+        validate_secret "$SECRET"
+    fi
 
     docker run -d \
         --name "$CONTAINER_NAME" \
@@ -155,10 +240,22 @@ menu_install() {
         simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$PORT" "$SECRET" > /dev/null
 
     clear
-    echo -e "${GREEN}Прокси успешно создан${NC}"
+    echo -e "${GREEN}✓ Прокси успешно создан${NC}"
+    
     IP=$(get_ip)
     LINK="tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+    
     echo -e "Link: ${BLUE}$LINK${NC}"
+    echo ""
+    
+    if [[ "$SECRET" =~ ^ee ]]; then
+        echo -e "${RED}⚠️  ВНИМАНИЕ: Этот прокси НЕ БУДЕТ РАБОТАТЬ НА ANDROID!${NC}"
+        echo -e "${YELLOW}Рекомендуется удалить и создать заново с другим доменом.${NC}"
+    else
+        echo -e "${GREEN}✓ Прокси полностью совместим с Android!${NC}"
+    fi
+    
+    echo ""
     qrencode -t ANSIUTF8 "$LINK"
 
     read -p "Установка завершена. Нажмите Enter..."
@@ -179,7 +276,13 @@ delete_proxy() {
 
     echo ""
     for i in "${!containers[@]}"; do
-        echo -e "${YELLOW}$((i+1)))${NC} ${containers[$i]}"
+        # Показываем, работает ли прокси на Android
+        SECRET=$(docker inspect "${containers[$i]}" --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}')
+        if [[ "$SECRET" =~ ^ee ]]; then
+            echo -e "${YELLOW}$((i+1)))${NC} ${containers[$i]} ${RED}[НЕ РАБОТАЕТ НА ANDROID]${NC}"
+        else
+            echo -e "${YELLOW}$((i+1)))${NC} ${containers[$i]} ${GREEN}[РАБОТАЕТ]${NC}"
+        fi
     done
 
     echo ""
@@ -219,6 +322,16 @@ full_uninstall() {
 show_status() {
     clear
     echo -e "${CYAN}--- СТАТУС ПРОКСИ ---${NC}"
+    echo -e "${YELLOW}Совместимость с Android:${NC}"
+    docker ps -a --format "{{.Names}}" | grep mtproto-proxy | while read name; do
+        SECRET=$(docker inspect "$name" --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}')
+        if [[ "$SECRET" =~ ^ee ]]; then
+            echo -e "${name}: ${RED}❌ НЕ РАБОТАЕТ НА ANDROID${NC}"
+        else
+            echo -e "${name}: ${GREEN}✓ РАБОТАЕТ${NC}"
+        fi
+    done
+    echo ""
     docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}" | grep mtproto-proxy
     read -p "Нажмите Enter..."
 }
@@ -258,6 +371,50 @@ restart_proxy() {
     read -p "Нажмите Enter..."
 }
 
+# --- ДОБАВЛЕНА НОВАЯ ФУНКЦИЯ: ПОЧИНИТЬ НЕРАБОЧИЕ ПРОКСИ ---
+fix_android_proxies() {
+    clear
+    echo -e "${YELLOW}--- ПОИСК И ИСПРАВЛЕНИЕ ПРОКСИ, НЕ РАБОТАЮЩИХ НА ANDROID ---${NC}"
+    
+    mapfile -t containers < <(docker ps -a --format "{{.Names}}" | grep "^mtproto-proxy")
+    local fixed=0
+    
+    for container in "${containers[@]}"; do
+        SECRET=$(docker inspect "$container" --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}')
+        
+        if [[ "$SECRET" =~ ^ee ]]; then
+            echo -e "${YELLOW}Найден проблемный прокси: $container${NC}"
+            
+            # Получаем порт
+            PORT=$(docker inspect "$container" --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}')
+            
+            # Останавливаем и удаляем старый
+            docker stop "$container" >/dev/null 2>&1
+            docker rm "$container" >/dev/null 2>&1
+            
+            # Создаем новый с безопасным секретом
+            NEW_SECRET=$(generate_safe_secret "google.com")
+            docker run -d \
+                --name "$container" \
+                --restart always \
+                -p "$PORT:$PORT" \
+                nineseconds/mtg:2 \
+                simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$PORT" "$NEW_SECRET" > /dev/null
+            
+            echo -e "${GREEN}✓ Прокси $container исправлен!${NC}"
+            ((fixed++))
+        fi
+    done
+    
+    if [ $fixed -eq 0 ]; then
+        echo -e "${GREEN}Все прокси уже совместимы с Android!${NC}"
+    else
+        echo -e "${GREEN}Исправлено прокси: $fixed${NC}"
+    fi
+    
+    read -p "Нажмите Enter..."
+}
+
 # --- СТАРТ ---
 check_root
 install_deps
@@ -275,6 +432,7 @@ while true; do
     echo -e "8) ${RED}Заблокировать клиента${NC}"
     echo -e "9) ${GREEN}Разблокировать клиента${NC}"
     echo -e "10) ${YELLOW}Перезапустить клиента${NC}"
+    echo -e "11) ${CYAN}🔧 Починить прокси для Android${NC}"
     echo -e "0) Выход${NC}"
 
     read -p "Пункт: " m_idx
@@ -290,6 +448,7 @@ while true; do
         8) block_proxy ;;
         9) unblock_proxy ;;
         10) restart_proxy ;;
+        11) fix_android_proxies ;;
         0) exit 0 ;;
         *) echo "Неверный ввод" ;;
     esac
